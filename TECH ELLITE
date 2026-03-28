@@ -1,395 +1,89 @@
-"""
-NEXA - Advanced AI Voice Assistant
-Complete Desktop Application with Wake Word Detection, Modern UI, and AI Integration
-"""
+from __future__ import annotations  #allows forward references in type hints
 
-from __future__ import annotations
-import datetime
-import logging
-import time
-import webbrowser
-import random
+import datetime     # for time/date operations
+import logging      # for logging messages
+import time         #for sleep/delays
+import webbrowser   # to open URLs in brower
+import random       # for random responses
+from abc import ABC, abstractmethod     #for creating abstract base classes
 import re
 import threading
-import urllib.parse
+import urllib.parse  # for URL encoding song names
+import pyttsx3      # text to speech lib
+import speech_recognition as sr  # speech to text library
+import smtplib #sends email
 import os
 import subprocess
-import json
-from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
-from queue import Queue
 
-# GUI
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
-
-# Audio & Speech
-import pyaudio
-import wave
-import struct
-
-# Google APIs
+# NEW: Import emotion detection libraries
 try:
-    from google.cloud import texttospeech, speech
-    from google.oauth2 import service_account
-    GOOGLE_AVAILABLE = True
-except ImportError:
-    GOOGLE_AVAILABLE = False
-    print("Google Cloud APIs not installed. Using fallback.")
-
-# OpenAI
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    print("OpenAI not installed. Using fallback.")
-
-# Wake word detection
-try:
-    import pvporcupine
-    PORCUPINE_AVAILABLE = True
-except ImportError:
-    PORCUPINE_AVAILABLE = False
-    print("Porcupine not installed. Wake word disabled.")
-
-# Emotion detection
-try:
-    import librosa
+    import librosa  #
     import numpy as np
     import soundfile as sf
     EMOTION_AVAILABLE = True
 except ImportError:
     EMOTION_AVAILABLE = False
-    print("Emotion detection libraries not installed.")
+    print("Warning: librosa not installed. Emotion detection disabled.")
+    print("Install with: pip install librosa soundfile numpy")
 
-# Email
-import smtplib
-from email.message import EmailMessage
-
-# ──────────────────────────────────────────────────────────────────
-#   CONFIGURATION
-# ──────────────────────────────────────────────────────────────────
+# -----------------------------------------------
+#   CONFIG
+# ----------------------------------------------
 class Config:
-    """Central configuration for Nexa"""
-    
-    # UI Settings
-    WINDOW_WIDTH = 1100
-    WINDOW_HEIGHT = 700
-    THEME_BG = "#050A0F"
-    THEME_CARD = "#0D1820"
-    THEME_CYAN = "#00E5FF"
-    THEME_TEXT = "#E8F4F8"
-    THEME_MUTED = "#6A8FA8"
-    
-    # Wake Word
-    PORCUPINE_ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY", "")  # Set your key
-    WAKE_WORDS = ["jarvis", "alexa", "computer"]  # Available built-in wake words
-    WAKE_SENSITIVITY = 0.5
-    
-    # Google Cloud
-    GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-    GOOGLE_TTS_VOICE = "en-US-Neural2-F"  # Female voice
-    GOOGLE_STT_LANGUAGE = "en-IN"
-    
-    # OpenAI
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_MODEL = "gpt-4o-mini"
-    
-    # Audio
-    SAMPLE_RATE = 16000
-    CHUNK_SIZE = 512
-    CHANNELS = 1
-    AUDIO_FORMAT = pyaudio.paInt16
-    
-    # Behavior
-    LISTEN_TIMEOUT = 5
-    PHRASE_LIMIT = 10
-    EMOTION_CHECK_INTERVAL = 3
-    
-    # Email (store in environment variables for security)
-    EMAIL_SENDER = os.getenv("NEXA_EMAIL", "")
-    EMAIL_PASSWORD = os.getenv("NEXA_EMAIL_PASSWORD", "")
+    voice_index:    int = 1          # which system voice to use
+    listen_timeout: int = 5          # max sec to wait for speech
+    phrase_limit:   int = 8          # max sec per phrase
+    language:       str = "en-IN"    # indian english
+    emotion_check_interval: int = 3  # check emotion every N interactions
 
-# ──────────────────────────────────────────────────────────────────
+# --------------------------------------------------
 #   LOGGING
-# ──────────────────────────────────────────────────────────────────
+# --------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+    level=logging.INFO,     # show INFO level and above
+    format="%(asctime)s  [%(levelname)s]  %(message)s",     # time+ level+ msg
+    datefmt="%H:%M:%S",     # show only hours:minutes:seconds
 )
-log = logging.getLogger("Nexa")
+log = logging.getLogger("Nexa")   # create logger named "Nexa"
 
-# ──────────────────────────────────────────────────────────────────
-#   WAKE WORD DETECTOR
-# ──────────────────────────────────────────────────────────────────
-class WakeWordDetector:
-    """Listens for wake word using Porcupine"""
-    
-    def __init__(self, access_key: str, keywords: List[str] = ["jarvis"], 
-                 sensitivity: float = 0.5):
-        self.enabled = PORCUPINE_AVAILABLE and access_key
-        self.running = False
-        self.callback = None
-        
-        if not self.enabled:
-            log.warning("Wake word detection disabled (Porcupine unavailable or no access key)")
-            return
-        
-        try:
-            self.porcupine = pvporcupine.create(
-                access_key=access_key,
-                keywords=keywords,
-                sensitivities=[sensitivity] * len(keywords)
-            )
-            self.pa = pyaudio.PyAudio()
-            self.stream = None
-            log.info(f"Wake word detector initialized: {keywords}")
-        except Exception as e:
-            log.error(f"Failed to initialize Porcupine: {e}")
-            self.enabled = False
-    
-    def start(self, callback):
-        """Start listening for wake word"""
-        if not self.enabled:
-            return
-        
-        self.callback = callback
-        self.running = True
-        
-        self.stream = self.pa.open(
-            rate=self.porcupine.sample_rate,
-            channels=1,
-            format=pyaudio.paInt16,
-            input=True,
-            frames_per_buffer=self.porcupine.frame_length
-        )
-        
-        threading.Thread(target=self._listen_loop, daemon=True).start()
-        log.info("Wake word detection started")
-    
-    def stop(self):
-        """Stop listening"""
-        self.running = False
-        if self.stream:
-            self.stream.close()
-        log.info("Wake word detection stopped")
-    
-    def _listen_loop(self):
-        """Main listening loop"""
-        while self.running:
-            try:
-                pcm = self.stream.read(self.porcupine.frame_length, 
-                                      exception_on_overflow=False)
-                pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
-                
-                keyword_index = self.porcupine.process(pcm)
-                
-                if keyword_index >= 0:
-                    log.info("Wake word detected!")
-                    if self.callback:
-                        self.callback()
-            except Exception as e:
-                log.error(f"Wake word detection error: {e}")
-                time.sleep(0.1)
-    
-    def cleanup(self):
-        """Clean up resources"""
-        self.stop()
-        if self.enabled:
-            if hasattr(self, 'porcupine'):
-                self.porcupine.delete()
-            if hasattr(self, 'pa'):
-                self.pa.terminate()
-
-# ──────────────────────────────────────────────────────────────────
-#   GOOGLE SPEECH SERVICES
-# ──────────────────────────────────────────────────────────────────
-class GoogleSpeechServices:
-    """Google Cloud Speech-to-Text and Text-to-Speech"""
-    
-    def __init__(self, credentials_path: str = ""):
-        self.enabled = GOOGLE_AVAILABLE and os.path.exists(credentials_path)
-        
-        if self.enabled:
-            try:
-                credentials = service_account.Credentials.from_service_account_file(
-                    credentials_path
-                )
-                self.tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
-                self.stt_client = speech.SpeechClient(credentials=credentials)
-                log.info("Google Speech Services initialized")
-            except Exception as e:
-                log.error(f"Failed to initialize Google services: {e}")
-                self.enabled = False
-        else:
-            log.warning("Google Speech Services disabled")
-    
-    def text_to_speech(self, text: str, voice_name: str = "en-US-Neural2-F") -> bytes:
-        """Convert text to speech audio"""
-        if not self.enabled:
-            return b""
-        
-        try:
-            synthesis_input = texttospeech.SynthesisInput(text=text)
-            
-            voice = texttospeech.VoiceSelectionParams(
-                language_code="en-US",
-                name=voice_name
-            )
-            
-            audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-                speaking_rate=1.0,
-                pitch=0.0
-            )
-            
-            response = self.tts_client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config
-            )
-            
-            return response.audio_content
-        except Exception as e:
-            log.error(f"TTS error: {e}")
-            return b""
-    
-    def speech_to_text(self, audio_data: bytes, sample_rate: int = 16000) -> str:
-        """Convert speech audio to text"""
-        if not self.enabled:
-            return ""
-        
-        try:
-            audio = speech.RecognitionAudio(content=audio_data)
-            
-            config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=sample_rate,
-                language_code="en-IN",
-                enable_automatic_punctuation=True
-            )
-            
-            response = self.stt_client.recognize(config=config, audio=audio)
-            
-            if response.results:
-                return response.results[0].alternatives[0].transcript
-            return ""
-        except Exception as e:
-            log.error(f"STT error: {e}")
-            return ""
-
-# ──────────────────────────────────────────────────────────────────
-#   OPENAI INTEGRATION
-# ──────────────────────────────────────────────────────────────────
-class OpenAIAssistant:
-    """OpenAI GPT integration for intelligent responses"""
-    
-    def __init__(self, api_key: str = ""):
-        self.enabled = OPENAI_AVAILABLE and api_key
-        
-        if self.enabled:
-            openai.api_key = api_key
-            self.conversation_history = []
-            self.system_prompt = """You are Nexa, an advanced AI voice assistant. 
-You are helpful, friendly, and concise. Keep responses brief and natural for voice interaction.
-Provide specific, actionable information. Use a warm, professional tone."""
-            log.info("OpenAI Assistant initialized")
-        else:
-            log.warning("OpenAI Assistant disabled")
-    
-    def get_response(self, user_input: str, context: Dict = None) -> str:
-        """Get intelligent response from OpenAI"""
-        if not self.enabled:
-            return self._fallback_response(user_input)
-        
-        try:
-            # Add user message to history
-            self.conversation_history.append({
-                "role": "user",
-                "content": user_input
-            })
-            
-            # Keep history manageable (last 10 exchanges)
-            if len(self.conversation_history) > 20:
-                self.conversation_history = self.conversation_history[-20:]
-            
-            messages = [
-                {"role": "system", "content": self.system_prompt}
-            ] + self.conversation_history
-            
-            response = openai.ChatCompletion.create(
-                model=Config.OPENAI_MODEL,
-                messages=messages,
-                max_tokens=150,
-                temperature=0.7
-            )
-            
-            assistant_message = response.choices[0].message.content.strip()
-            
-            # Add to history
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": assistant_message
-            })
-            
-            return assistant_message
-            
-        except Exception as e:
-            log.error(f"OpenAI error: {e}")
-            return self._fallback_response(user_input)
-    
-    def _fallback_response(self, user_input: str) -> str:
-        """Simple fallback responses when OpenAI unavailable"""
-        responses = {
-            "hello": "Hello! How can I assist you today?",
-            "how are you": "I'm functioning perfectly, thank you for asking!",
-            "thank": "You're welcome! Happy to help.",
-            "bye": "Goodbye! Have a great day!",
-        }
-        
-        user_lower = user_input.lower()
-        for key, response in responses.items():
-            if key in user_lower:
-                return response
-        
-        return "I understand. How else can I help you?"
-    
-    def reset_conversation(self):
-        """Clear conversation history"""
-        self.conversation_history = []
-
-# ──────────────────────────────────────────────────────────────────
+# -----------------------------------------------
 #   EMOTION DETECTOR
-# ──────────────────────────────────────────────────────────────────
+# -----------------------------------------------
 class EmotionDetector:
-    """Detects emotion from audio features"""
+    """Detects emotion from audio features using voice characteristics."""
     
-    def __init__(self):
+    def __init__(self) -> None:
         self.enabled = EMOTION_AVAILABLE
-    
-    def analyze_audio(self, audio_data: bytes, sample_rate: int = 16000) -> str:
-        """Analyze audio and return emotion"""
+        
+    def analyze_audio(self, audio_data, sample_rate: int = 16000) -> str:
+        """
+        Analyze audio to detect emotion based on voice features.
+        Returns: 'happy', 'sad', 'stressed', 'neutral', or 'angry'
+        """
         if not self.enabled:
             return 'neutral'
-        
-        try:
-            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
-            audio_np = audio_np / np.max(np.abs(audio_np) + 1e-8)
             
+        try:
+            # Convert audio to numpy array
+            audio_np = np.frombuffer(audio_data.get_raw_data(), dtype=np.int16).astype(np.float32)
+            audio_np = audio_np / np.max(np.abs(audio_np))  # Normalize
+            
+            # Extract features
             pitch = self._extract_pitch(audio_np, sample_rate)
             energy = self._extract_energy(audio_np)
             speech_rate = self._estimate_speech_rate(audio_np, sample_rate)
             
+            # Classify emotion based on features
             emotion = self._classify_emotion(pitch, energy, speech_rate)
+            log.info(f"Detected emotion: {emotion} (pitch: {pitch:.1f}, energy: {energy:.3f}, rate: {speech_rate:.1f})")
             return emotion
+            
         except Exception as e:
             log.error(f"Emotion detection error: {e}")
             return 'neutral'
     
     def _extract_pitch(self, audio: np.ndarray, sr: int) -> float:
+        """Extract average pitch (F0) from audio."""
         try:
             pitches, magnitudes = librosa.piptrack(y=audio, sr=sr)
             pitch_values = []
@@ -403,21 +97,35 @@ class EmotionDetector:
             return 150.0
     
     def _extract_energy(self, audio: np.ndarray) -> float:
+        """Extract average energy/volume from audio."""
         return float(np.sqrt(np.mean(audio**2)))
     
     def _estimate_speech_rate(self, audio: np.ndarray, sr: int) -> float:
+        """Estimate speaking rate (syllables per second approximation)."""
         try:
             onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
             tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)[0]
-            return tempo / 60.0
+            return tempo / 60.0  # Convert to events per second
         except:
             return 2.0
     
     def _classify_emotion(self, pitch: float, energy: float, speech_rate: float) -> str:
-        pitch_score = (pitch - 150) / 50
-        energy_score = energy / 0.1
-        rate_score = (speech_rate - 2.0) / 1.0
+        """
+        Classify emotion based on voice features.
         
+        Emotional voice patterns:
+        - Sad: Low pitch, low energy, slow rate
+        - Stressed: High pitch, high energy, fast rate
+        - Happy: Medium-high pitch, medium-high energy, moderate rate
+        - Angry: High pitch, very high energy, fast rate
+        - Neutral: Medium pitch, medium energy, normal rate
+        """
+        # Normalize features for comparison
+        pitch_score = (pitch - 150) / 50  # Normalize around typical speaking pitch
+        energy_score = energy / 0.1  # Normalize energy
+        rate_score = (speech_rate - 2.0) / 1.0  # Normalize around typical rate
+        
+        # Emotion classification logic
         if energy_score < 0.5 and pitch_score < -0.5 and rate_score < -0.3:
             return 'sad'
         elif pitch_score > 1.0 and energy_score > 1.5 and rate_score > 0.5:
@@ -429,567 +137,543 @@ class EmotionDetector:
         else:
             return 'neutral'
 
-# ──────────────────────────────────────────────────────────────────
-#   AUDIO HANDLER
-# ──────────────────────────────────────────────────────────────────
-class AudioHandler:
-    """Handles audio recording and playback"""
-    
-    def __init__(self):
-        self.pa = pyaudio.PyAudio()
-        self.sample_rate = Config.SAMPLE_RATE
-        self.chunk_size = Config.CHUNK_SIZE
-    
-    def record_audio(self, duration: int = 5) -> bytes:
-        """Record audio for specified duration"""
-        try:
-            stream = self.pa.open(
-                format=Config.AUDIO_FORMAT,
-                channels=Config.CHANNELS,
-                rate=self.sample_rate,
-                input=True,
-                frames_per_buffer=self.chunk_size
-            )
-            
-            frames = []
-            for _ in range(0, int(self.sample_rate / self.chunk_size * duration)):
-                data = stream.read(self.chunk_size, exception_on_overflow=False)
-                frames.append(data)
-            
-            stream.stop_stream()
-            stream.close()
-            
-            return b''.join(frames)
-        except Exception as e:
-            log.error(f"Recording error: {e}")
-            return b""
-    
-    def play_audio(self, audio_data: bytes):
-        """Play audio data"""
-        try:
-            stream = self.pa.open(
-                format=Config.AUDIO_FORMAT,
-                channels=Config.CHANNELS,
-                rate=self.sample_rate,
-                output=True
-            )
-            
-            stream.write(audio_data)
-            stream.stop_stream()
-            stream.close()
-        except Exception as e:
-            log.error(f"Playback error: {e}")
-    
-    def cleanup(self):
-        """Clean up audio resources"""
-        self.pa.terminate()
+# -----------------------------------------------
+#   VOICE input
+# -----------------------------------------------
+class Speaker:
+    def __init__(self, voice_index: int = 1) -> None:
+        self._voice_index = voice_index     # store which voice to use
 
-# ──────────────────────────────────────────────────────────────────
-#   SKILLS (Same as before but enhanced)
-# ──────────────────────────────────────────────────────────────────
+    def _make_engine(self) -> pyttsx3.Engine:
+        engine = pyttsx3.init()     #initialize TTS engine
+        voices = engine.getProperty("voices")   # get available system voices
+        if voices:
+            idx = min(self._voice_index, len(voices) - 1)   # prevent index out of range
+            engine.setProperty("voice", voices[idx].id)     #set the voice
+        return engine
+
+    def say(self, text: str) -> None:
+        log.info("Nexa: %s", text) # log what will be spoken
+        engine = self._make_engine()   # fresh engine every time
+        engine.say(text)    # Queue the text
+        engine.runAndWait() # speak it (blocking)
+        engine.stop()       # clean shutdown
+
+# ----------------------------------------
+#   VOICE output
+# -----------------------------------------
+class Listener:
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg     # store config
+        self._recognizer = sr.Recognizer()     # create speech recognizer
+
+    def listen(self, return_audio: bool = False) -> str | tuple[str, any]:
+        """
+        Listen for speech input.
+        If return_audio=True, returns (text, audio_data) tuple for emotion analysis.
+        """
+        r = self._recognizer
+        try:
+            with sr.Microphone() as source: # open microphone
+                log.info("Listening…")
+                r.adjust_for_ambient_noise(source, duration=0.8)    #calibrate for noise
+                r.pause_threshold = 1.0     # 1 sec silence = end
+                audio = r.listen(
+                    source,
+                    timeout=self._cfg.listen_timeout,   # wait 5sec for speech start
+                    phrase_time_limit=self._cfg.phrase_limit,   # max 8 sec recording
+                )
+
+            log.info("Recognising…")
+            text = r.recognize_google(audio, language=self._cfg.language)   # Google API
+            log.info("You said: %s", text)
+            
+            if return_audio:
+                return text.lower(), audio
+            return text.lower() # return lowercase text
+
+        except sr.WaitTimeoutError:     # no speech detection
+            log.debug("No speech detected (timeout).")
+        except sr.UnknownValueError:    # couldn't understand audio
+            log.debug("Audio not understood.")
+        except sr.RequestError as exc:  # API/network error
+            log.error("Speech service error: %s", exc)
+        
+        if return_audio:
+            return "", None
+        return "" # return empty string on any error
+
+# -----------------------------------------------
+#   SKILL BASE CLASS
+# ------------------------------------------------
 class Skill(ABC):
     @property
     @abstractmethod
-    def triggers(self) -> List[str]: ...
-    
-    @abstractmethod
-    def run(self, query: str, nexa_app) -> str: ...
-    
-    def matches(self, query: str) -> bool:
-        return any(t in query.lower() for t in self.triggers)
+    def triggers(self) -> list[str]: ...    # must define trigger keywords
 
-class TimeSkill(Skill):
-    triggers = ["time", "what time"]
+    @abstractmethod
+    def run(self, query: str, speaker: Speaker) -> None: ...    # must define action
+
+    def matches(self, query: str) -> bool:
+        return any(t in query for t in self.triggers)   # check if any trigger in query
+
+# -----------------------------------------------
+#   EMOTIONAL SUPPORT SKILL
+# -----------------------------------------------
+class EmotionalSupportSkill(Skill):
+    """Provides comfort and positivity when user is sad or stressed."""
     
-    def run(self, query: str, nexa_app) -> str:
+    triggers = []  # This skill is triggered by emotion, not keywords
+    
+    COMFORTING_RESPONSES = [
+        "I'm here for you. Would you like to talk about what's on your mind?",
+        "I notice you might be feeling down. How about we do something to lift your spirits?",
+        "You sound like you could use a break. How about a fun fact or a joke?",
+        "I'm sensing some stress in your voice. Let's take a moment to relax.",
+    ]
+    
+    UPLIFTING_TOPICS = {
+        "joke": [
+            "Why don't scientists trust atoms? Because they make up everything!",
+            "What do you call a bear with no teeth? A gummy bear!",
+            "Why did the scarecrow win an award? He was outstanding in his field!",
+            "What do you call a fake noodle? An impasta!",
+            "Why don't eggs tell jokes? They'd crack each other up!",
+            "What did the ocean say to the beach? Nothing, it just waved!",
+        ],
+        "fun_fact": [
+            "Did you know? Honey never spoils. Archaeologists have found 3000-year-old honey in Egyptian tombs that's still edible!",
+            "Here's something cool: Octopuses have three hearts and blue blood!",
+            "Fun fact: A group of flamingos is called a flamboyance. Isn't that fabulous?",
+            "Did you know? Penguins propose to their mates with pebbles. So romantic!",
+            "Interesting fact: Sea otters hold hands while sleeping so they don't drift apart!",
+            "Did you know? Cows have best friends and get stressed when separated!",
+        ],
+        "motivation": [
+            "Remember, every storm runs out of rain. This too shall pass.",
+            "You're stronger than you think. Take it one step at a time.",
+            "Tomorrow is a fresh start with no mistakes in it yet.",
+            "Even the darkest night will end and the sun will rise.",
+            "You've overcome challenges before, and you'll overcome this one too.",
+            "Small progress is still progress. Be proud of every step forward.",
+        ],
+        "music": [
+            "How about I open Spotify so you can listen to your favorite music?",
+            "Music can really help. Shall I open YouTube for some relaxing tunes?",
+        ]
+    }
+    
+    def run(self, query: str, speaker: Speaker) -> None:
+        # Initial comforting response
+        speaker.say(random.choice(self.COMFORTING_RESPONSES))
+        time.sleep(1)
+        
+        # Offer options
+        speaker.say("I can tell you a joke, share a fun fact, give you some motivation, or play some music. What would you prefer?")
+    
+    def provide_support(self, category: str, speaker: Speaker) -> None:
+        """Provide specific type of emotional support."""
+        if category in self.UPLIFTING_TOPICS:
+            message = random.choice(self.UPLIFTING_TOPICS[category])
+            speaker.say(message)
+            
+            # Open music app if requested
+            if category == "music" and "spotify" in message.lower():
+                webbrowser.open("https://spotify.com")
+            elif category == "music" and "youtube" in message.lower():
+                webbrowser.open("https://youtube.com")
+        else:
+            speaker.say("I'm here to listen and support you however I can.")
+
+# ------------------------------------------------
+#   SKILLS
+# ------------------------------------------------
+class TimeSkill(Skill):
+    triggers = ["time"] # activate on "time" keyword
+
+    def run(self, query: str, speaker: Speaker) -> None:
         now = datetime.datetime.now().strftime("%I:%M %p")
-        return f"The time is {now}"
+        speaker.say(f"The time is {now}")
+
 
 class DateSkill(Skill):
-    triggers = ["date", "what date", "today"]
-    
-    def run(self, query: str, nexa_app) -> str:
+    triggers = ["date"] # activate on "date" keyword
+
+    def run(self, query: str, speaker: Speaker) -> None:
         now = datetime.datetime.now()
-        return f"Today is {now.strftime('%A, %B %d, %Y')}"
+        speaker.say(f"Today is {now.day} {now.strftime('%B')} {now.year}")
+
 
 class WebSkill(Skill):
-    SITES = {
+    SITES: dict[str, str] = {
         "youtube": "https://youtube.com",
-        "google": "https://google.com",
-        "gmail": "https://mail.google.com",
-        "github": "https://github.com",
-        "maps": "https://maps.google.com",
+        "google":  "https://google.com",
+        "github":  "https://github.com",
+        "maps":    "https://maps.google.com",
         "netflix": "https://netflix.com",
         "spotify": "https://spotify.com",
-        "amazon": "https://amazon.in",
+        "gitlab": "https://gitlab.com",
+        "replit": "https://replit.com",
+        "uber": "https://uber.com",
+        "ola": "https://ola.com",
         "instagram": "https://instagram.com",
         "linkedin": "https://linkedin.com",
         "twitter": "https://twitter.com",
+        "amazon": "https://amazon.in",
+        "flipkart": "https://flipkart.com",
+        "zomato": "https://zomato.com",
+        "swiggy": "https://swiggy.com",
+        "gmail": "https://mail.google.com",
+        "drive": "https://drive.google.com",
+        "calendar": "https://calendar.google.com",
+        "notion": "https://notion.so",
+        "snapchat": "https://snapchat.com",
+        "tiktok": "https://tiktok.com",
+        "telegram": "https://web.telegram.org",
+        "whatsapp": "https://web.whatsapp.com",
+        "threads": "https://threads.net",
     }
-    
-    triggers = [f"open {k}" for k in SITES.keys()]
-    
-    def run(self, query: str, nexa_app) -> str:
+    triggers = [f"open {k}" for k in SITES]
+
+    def run(self, query: str, speaker: Speaker) -> None:
         for keyword, url in self.SITES.items():
-            if keyword in query.lower():
-                webbrowser.open(url)
-                return f"Opening {keyword}"
-        return "Which website would you like to open?"
-
-class SearchSkill(Skill):
-    triggers = ["search", "google", "find", "look up"]
-    
-    def run(self, query: str, nexa_app) -> str:
-        # Extract search query
-        for trigger in self.triggers:
-            if trigger in query.lower():
-                search_query = query.lower().replace(trigger, "").strip()
-                if search_query:
-                    encoded = urllib.parse.quote(search_query)
-                    webbrowser.open(f"https://www.google.com/search?q={encoded}")
-                    return f"Searching for {search_query}"
-        return "What would you like me to search for?"
-
-class WeatherSkill(Skill):
-    triggers = ["weather", "temperature", "forecast"]
-    
-    def run(self, query: str, nexa_app) -> str:
-        # In production, integrate with weather API
-        return "Opening weather forecast for your location"
-
-class JokeSkill(Skill):
-    triggers = ["joke", "tell me a joke", "make me laugh"]
-    
-    JOKES = [
-        "Why don't scientists trust atoms? Because they make up everything!",
-        "What do you call a bear with no teeth? A gummy bear!",
-        "Why did the scarecrow win an award? He was outstanding in his field!",
-        "What do you call a fake noodle? An impasta!",
-        "Why don't eggs tell jokes? They'd crack each other up!",
+            if keyword in query:    # check which site mentioned
+                webbrowser.open(url)    # open in defualt browser
+                speaker.say(f"Opening {keyword}")
+                return
+            
+# ------------------------------------------------
+#   MUSIC SKILL  (play song on YouTube or Spotify)
+# ------------------------------------------------
+class MusicSkill(Skill):
+    triggers = [
+        "play",
+        "play song",
+        "play music",
+        "play on youtube",
+        "play on spotify",
     ]
-    
-    def run(self, query: str, nexa_app) -> str:
-        return random.choice(self.JOKES)
 
-# ──────────────────────────────────────────────────────────────────
-#   MAIN NEXA APPLICATION
-# ──────────────────────────────────────────────────────────────────
-class NexaApp:
-    """Main Nexa AI Assistant Application"""
-    
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Nexa AI Assistant")
-        self.root.geometry(f"{Config.WINDOW_WIDTH}x{Config.WINDOW_HEIGHT}")
-        self.root.configure(bg=Config.THEME_BG)
-        
-        # Initialize components
-        self.wake_detector = WakeWordDetector(
-            access_key=Config.PORCUPINE_ACCESS_KEY,
-            keywords=["jarvis"],  # Use built-in wake word
-            sensitivity=Config.WAKE_SENSITIVITY
+    def __init__(self, listener: Listener) -> None:
+        self._listener = listener
+
+    @staticmethod
+    def _extract_song(query: str) -> tuple[str, str]:
+        """Returns (song_name, platform) — platform is 'youtube' or 'spotify'."""
+
+        # Detect platform
+        if "spotify" in query:
+            platform = "spotify"
+        else:
+            platform = "youtube"   # default to YouTube
+
+        # Strip filler words to isolate the song name
+        song = query
+        for phrase in [
+            "nexa", "play", "on spotify", "on youtube", "in spotify",
+            "in youtube", "spotify", "youtube", "song", "track", "music",
+            "please", "for me",
+        ]:
+            song = song.replace(phrase, "")
+
+        song = song.strip()
+        return song, platform
+
+    def run(self, query: str, speaker: Speaker) -> None:
+        song, platform = self._extract_song(query)
+
+        # If song name is empty after stripping, ask the user
+        if not song:
+            speaker.say("What song would you like me to play?")
+            song = self._listener.listen()
+            if not song:
+                speaker.say("I didn't catch the song name. Please try again.")
+                return
+
+        encoded = urllib.parse.quote(song)  # URL-safe encode song name
+
+        if platform == "spotify":
+            # Opens Spotify Web Player search — no app needed
+            url = f"https://open.spotify.com/search/{encoded}"
+            speaker.say(f"Playing {song} on Spotify.")
+            log.info("Opening Spotify: %s", url)
+            webbrowser.open(url)
+
+        else:
+            # Opens YouTube search results for the song
+            url = f"https://www.youtube.com/results?search_query={encoded}"
+            speaker.say(f"Playing {song} on YouTube.")
+            log.info("Opening YouTube: %s", url)
+            webbrowser.open(url)
+
+#----------------------------------------
+# RemainderSkill
+#----------------------------------------
+class ReminderSkill(Skill):
+    triggers = ["remind me", "set reminder", "reminder"]
+
+    def __init__(self, listener: Listener) -> None:
+        self._listener = listener
+
+    @staticmethod
+    def _parse_time(text: str) -> datetime.datetime | None:
+        now = datetime.datetime.now()
+
+        pattern = re.compile(
+            r"""
+            (\d{1,2})           # hour
+            [:\s]?              # optional colon or space
+            (\d{2})?            # optional minutes
+            \s*
+            (am|pm)?            # optional am/pm
+            """,
+            re.VERBOSE | re.IGNORECASE,
         )
-        
-        self.google_services = GoogleSpeechServices(Config.GOOGLE_CREDENTIALS_PATH)
-        self.openai_assistant = OpenAIAssistant(Config.OPENAI_API_KEY)
-        self.emotion_detector = EmotionDetector()
-        self.audio_handler = AudioHandler()
-        
-        # Skills
-        self.skills = [
+
+        match = pattern.search(text)
+        if not match:
+            return None
+
+        hour   = int(match.group(1))
+        minute = int(match.group(2)) if match.group(2) else 0
+        ampm   = match.group(3).lower() if match.group(3) else None
+
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        elif ampm is None and 1 <= hour <= 7:
+            hour += 12
+
+        try:
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except ValueError:
+            return None
+
+        if target <= now:
+            target += datetime.timedelta(days=1)
+
+        return target
+
+    def _fire_at(self, target: datetime.datetime, about: str, speaker: Speaker) -> None:
+        def _wait_and_fire():
+            delay = (target - datetime.datetime.now()).total_seconds()
+            if delay > 0:
+                time.sleep(delay)
+            log.info("Firing reminder: %s", about)
+            speaker.say(f"Reminder: {about}")
+
+        t = threading.Thread(target=_wait_and_fire, daemon=True)
+        t.start()
+
+    def run(self, query: str, speaker: Speaker) -> None:
+        about = ""
+        for prep in ("about", "for", "to"):
+            m = re.search(rf"{prep}\s+(.+?)(?:\s+at\s+|\s+by\s+|\s*$)", query)
+            if m:
+                about = m.group(1).strip()
+                break
+
+        if not about:
+            speaker.say("What should I remind you about?")
+            about = self._listener.listen() or "something important"
+
+        target = self._parse_time(query)
+
+        if target is None:
+            speaker.say("At what time should I remind you?")
+            time_query = self._listener.listen()
+            target = self._parse_time(time_query)
+
+        if target is None:
+            speaker.say("I couldn't catch the time. I'll remind you in 60 seconds.")
+            target = datetime.datetime.now() + datetime.timedelta(seconds=60)
+
+        time_str = target.strftime("%I:%M %p")
+        speaker.say(f"Got it. I'll remind you about '{about}' at {time_str}.")
+        log.info("Reminder scheduled: '%s' at %s", about, time_str)
+
+        self._fire_at(target, about, speaker)
+
+
+# ---------------------------------------------
+#   COMMAND BUS
+# ---------------------------------------------
+class CommandBus:
+    def __init__(self, skills: list[Skill], speaker: Speaker) -> None:
+        self._skills  = skills  # list of all available skills
+        self._speaker = speaker
+
+    def dispatch(self, query: str) -> bool:
+        for skill in self._skills:      # check each skills
+            if skill.matches(query):    # does query contain skill's trigger?
+                skill.run(query, self._speaker)     # execute skill
+                return True     # command handled
+        return False        # no skill matched
+
+# ------------------------------------------------
+#   GREETING
+# --------------------------------------------------
+def _greeting() -> str:
+    hour = datetime.datetime.now().hour
+    if   6  <= hour < 12: salutation = "Good morning"
+    elif 12 <= hour < 18: salutation = "Good afternoon"
+    elif 18 <= hour < 24: salutation = "Good evening"
+    else:                 salutation = "Good night"
+    return f"{salutation}. Nexa at your service. How may I help you?"
+
+# ------------------------------------------------------
+#   FILE OPEN SKILL
+# ------------------------------------------------------
+class FileOpenSkill(Skill):
+    USER_HOME = os.path.expanduser("~")
+
+    FILES = {
+        "notepad": "notepad.exe",
+        "calculator": "calc.exe",
+        "music": os.path.join(USER_HOME, "Music", "song.mp3"),
+    }
+
+    triggers = [f"open {k}" for k in FILES]
+
+    def run(self, query: str, speaker: Speaker) -> None:
+        for name, path in self.FILES.items():
+            if name in query:
+                try:
+                    if path.endswith(".exe"):
+                        subprocess.Popen(path)
+                    else:
+                        if os.path.exists(path):
+                            os.startfile(path)
+                        else:
+                            speaker.say(f"I couldn't find {name} file.")
+                            return
+                    speaker.say(f"Opening {name}")
+                except Exception as e:
+                    speaker.say("Something went wrong while opening.")
+                return
+
+# -------------------------------------------------
+#  Nexa  ← FIX: added __init__ and moved _handle_emotion here
+# ------------------------------------------------
+class Nexa:
+    def __init__(
+        self,
+        speaker: Speaker,
+        listener: Listener,
+        bus: CommandBus,
+        emotion_detector: EmotionDetector,
+        emotional_support: EmotionalSupportSkill,
+        cfg: Config,
+    ) -> None:
+        self._speaker           = speaker
+        self._listener          = listener
+        self._bus               = bus
+        self._emotion_detector  = emotion_detector
+        self._emotional_support = emotional_support
+        self._cfg               = cfg
+        self._interaction_count = 0
+
+    @classmethod
+    def build(cls) -> "Nexa":
+        cfg      = Config()
+        speaker  = Speaker(cfg.voice_index)
+        listener = Listener(cfg)
+        emotion_detector  = EmotionDetector()
+        emotional_support = EmotionalSupportSkill()
+
+        skills: list[Skill] = [
             TimeSkill(),
             DateSkill(),
             WebSkill(),
-            SearchSkill(),
-            WeatherSkill(),
-            JokeSkill(),
+            MusicSkill(listener),       # FIX: was missing from original build()
+            ReminderSkill(listener),
+            Email(listener),
+            FileOpenSkill(),
         ]
-        
-        # State
-        self.is_listening = False
-        self.conversation_history = []
-        self.interaction_count = 0
-        
-        # Setup UI
-        self.setup_ui()
-        
-        # Start wake word detection
-        if self.wake_detector.enabled:
-            self.wake_detector.start(self.on_wake_word)
-            self.update_status("Wake word active", "listening")
-        else:
-            self.update_status("Ready - Click to speak", "ready")
-        
-        # Protocol for window close
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-    
-    def setup_ui(self):
-        """Create the modern UI inspired by the HTML design"""
-        
-        # Main container
-        main_frame = tk.Frame(self.root, bg=Config.THEME_BG)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # Header
-        header = tk.Frame(main_frame, bg=Config.THEME_BG)
-        header.pack(fill=tk.X, pady=(0, 20))
-        
-        # Logo
-        logo_frame = tk.Frame(header, bg=Config.THEME_BG)
-        logo_frame.pack(side=tk.LEFT)
-        
-        logo_text = tk.Label(
-            logo_frame,
-            text="Nexa",
-            font=("Syne", 24, "bold"),
-            bg=Config.THEME_BG,
-            fg=Config.THEME_TEXT
-        )
-        logo_text.pack(side=tk.LEFT)
-        
-        # Status badge
-        self.status_frame = tk.Frame(header, bg=Config.THEME_CARD, 
-                                     highlightbackground=Config.THEME_CYAN,
-                                     highlightthickness=1)
-        self.status_frame.pack(side=tk.RIGHT, padx=10)
-        
-        self.status_label = tk.Label(
-            self.status_frame,
-            text="● READY",
-            font=("DM Mono", 10),
-            bg=Config.THEME_CARD,
-            fg=Config.THEME_CYAN,
-            padx=15,
-            pady=5
-        )
-        self.status_label.pack()
-        
-        # Content area (split into left and right panels)
-        content = tk.Frame(main_frame, bg=Config.THEME_BG)
-        content.pack(fill=tk.BOTH, expand=True)
-        
-        # Left panel - Microphone and controls
-        left_panel = tk.Frame(content, bg=Config.THEME_CARD, 
-                             highlightbackground=Config.THEME_CYAN,
-                             highlightthickness=1)
-        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        
-        # Microphone section
-        mic_section = tk.Frame(left_panel, bg=Config.THEME_CARD)
-        mic_section.pack(pady=40)
-        
-        mic_label = tk.Label(
-            mic_section,
-            text="VOICE INTERFACE",
-            font=("DM Mono", 10),
-            bg=Config.THEME_CARD,
-            fg=Config.THEME_MUTED
-        )
-        mic_label.pack(pady=(0, 20))
-        
-        # Microphone button
-        self.mic_button = tk.Button(
-            mic_section,
-            text="🎤",
-            font=("Arial", 48),
-            bg=Config.THEME_BG,
-            fg=Config.THEME_CYAN,
-            activebackground=Config.THEME_CYAN,
-            activeforeground=Config.THEME_BG,
-            relief=tk.FLAT,
-            width=3,
-            height=1,
-            command=self.toggle_listening,
-            cursor="hand2"
-        )
-        self.mic_button.pack()
-        
-        self.mic_status = tk.Label(
-            mic_section,
-            text="Tap to Start Listening",
-            font=("Syne", 12),
-            bg=Config.THEME_CARD,
-            fg=Config.THEME_MUTED
-        )
-        self.mic_status.pack(pady=(10, 0))
-        
-        # Quick actions
-        quick_frame = tk.Frame(left_panel, bg=Config.THEME_CARD)
-        quick_frame.pack(pady=20)
-        
-        tk.Label(
-            quick_frame,
-            text="QUICK ACTIONS",
-            font=("DM Mono", 9),
-            bg=Config.THEME_CARD,
-            fg=Config.THEME_MUTED
-        ).pack(pady=(0, 10))
-        
-        quick_buttons_frame = tk.Frame(quick_frame, bg=Config.THEME_CARD)
-        quick_buttons_frame.pack()
-        
-        quick_actions = [
-            ("⏱ Time", "what time is it"),
-            ("📅 Date", "what's the date"),
-            ("🌐 Search", "search google"),
-            ("😄 Joke", "tell me a joke"),
-        ]
-        
-        for i, (label, command) in enumerate(quick_actions):
-            btn = tk.Button(
-                quick_buttons_frame,
-                text=label,
-                font=("Syne", 10),
-                bg=Config.THEME_BG,
-                fg=Config.THEME_CYAN,
-                relief=tk.FLAT,
-                padx=10,
-                pady=5,
-                command=lambda cmd=command: self.process_command(cmd),
-                cursor="hand2"
-            )
-            btn.grid(row=i//2, column=i%2, padx=5, pady=5)
-        
-        # Right panel - Chat history
-        right_panel = tk.Frame(content, bg=Config.THEME_CARD,
-                              highlightbackground=Config.THEME_CYAN,
-                              highlightthickness=1)
-        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        
-        chat_header = tk.Label(
-            right_panel,
-            text="CONVERSATION HISTORY",
-            font=("DM Mono", 10),
-            bg=Config.THEME_CARD,
-            fg=Config.THEME_MUTED
-        )
-        chat_header.pack(pady=10)
-        
-        # Chat display
-        self.chat_display = scrolledtext.ScrolledText(
-            right_panel,
-            wrap=tk.WORD,
-            font=("Syne", 11),
-            bg=Config.THEME_BG,
-            fg=Config.THEME_TEXT,
-            relief=tk.FLAT,
-            padx=15,
-            pady=15,
-            state=tk.DISABLED
-        )
-        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Configure text tags for styling
-        self.chat_display.tag_config("user", foreground="#4A9EFF", font=("Syne", 11, "bold"))
-        self.chat_display.tag_config("nexa", foreground=Config.THEME_CYAN, font=("Syne", 11, "bold"))
-        self.chat_display.tag_config("timestamp", foreground=Config.THEME_MUTED, font=("DM Mono", 9))
-        self.chat_display.tag_config("emotion", foreground="#FFD700", font=("DM Mono", 9))
-        
-        # Bottom controls
-        bottom_frame = tk.Frame(main_frame, bg=Config.THEME_BG)
-        bottom_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        # Settings button
-        settings_btn = tk.Button(
-            bottom_frame,
-            text="⚙ Settings",
-            font=("Syne", 10),
-            bg=Config.THEME_CARD,
-            fg=Config.THEME_MUTED,
-            relief=tk.FLAT,
-            padx=15,
-            pady=5,
-            command=self.show_settings,
-            cursor="hand2"
-        )
-        settings_btn.pack(side=tk.LEFT)
-        
-        # Clear chat button
-        clear_btn = tk.Button(
-            bottom_frame,
-            text="🗑 Clear Chat",
-            font=("Syne", 10),
-            bg=Config.THEME_CARD,
-            fg=Config.THEME_MUTED,
-            relief=tk.FLAT,
-            padx=15,
-            pady=5,
-            command=self.clear_chat,
-            cursor="hand2"
-        )
-        clear_btn.pack(side=tk.LEFT, padx=10)
-    
-    def add_message(self, sender: str, message: str, emotion: str = "neutral"):
-        """Add message to chat display"""
-        self.chat_display.config(state=tk.NORMAL)
-        
-        timestamp = datetime.datetime.now().strftime("%H:%M")
-        
-        if sender == "user":
-            self.chat_display.insert(tk.END, f"\nYou", "user")
-            self.chat_display.insert(tk.END, f" • {timestamp}", "timestamp")
-            self.chat_display.insert(tk.END, f"\n{message}\n")
-        else:
-            self.chat_display.insert(tk.END, f"\nNexa", "nexa")
-            self.chat_display.insert(tk.END, f" • {timestamp}", "timestamp")
-            if emotion != "neutral":
-                self.chat_display.insert(tk.END, f" • {emotion}", "emotion")
-            self.chat_display.insert(tk.END, f"\n{message}\n")
-        
-        self.chat_display.see(tk.END)
-        self.chat_display.config(state=tk.DISABLED)
-    
-    def update_status(self, text: str, state: str = "ready"):
-        """Update status indicator"""
-        colors = {
-            "listening": Config.THEME_CYAN,
-            "processing": "#FFD700",
-            "ready": "#00FF00",
-            "error": "#FF0000"
-        }
-        
-        self.status_label.config(text=f"● {text.upper()}", fg=colors.get(state, Config.THEME_CYAN))
-    
-    def on_wake_word(self):
-        """Called when wake word detected"""
-        self.root.after(0, self._wake_word_ui_update)
-    
-    def _wake_word_ui_update(self):
-        """UI updates for wake word (must run in main thread)"""
-        self.add_message("system", "Wake word detected!", "info")
-        self.toggle_listening()
-    
-    def toggle_listening(self):
-        """Toggle listening state"""
-        if self.is_listening:
-            self.stop_listening()
-        else:
-            self.start_listening()
-    
-    def start_listening(self):
-        """Start listening for user input"""
-        self.is_listening = True
-        self.update_status("Listening", "listening")
-        self.mic_status.config(text="Listening... Speak now")
-        self.mic_button.config(bg=Config.THEME_CYAN, fg=Config.THEME_BG)
-        
-        # Run listening in separate thread
-        threading.Thread(target=self._listen_and_process, daemon=True).start()
-    
-    def stop_listening(self):
-        """Stop listening"""
-        self.is_listening = False
-        self.update_status("Ready", "ready")
-        self.mic_status.config(text="Tap to Start Listening")
-        self.mic_button.config(bg=Config.THEME_BG, fg=Config.THEME_CYAN)
-    
-    def _listen_and_process(self):
-        """Listen for audio and process it"""
-        try:
-            # Record audio
-            audio_data = self.audio_handler.record_audio(duration=5)
-            
-            # Update UI
-            self.root.after(0, lambda: self.update_status("Processing", "processing"))
-            
-            # Speech to text
-            if self.google_services.enabled:
-                text = self.google_services.speech_to_text(audio_data)
-            else:
-                text = "Speech recognition not available"
-            
-            if text:
-                # Add to chat
-                self.root.after(0, lambda: self.add_message("user", text))
-                
-                # Detect emotion
-                emotion = self.emotion_detector.analyze_audio(audio_data)
-                
-                # Process command
-                self.root.after(0, lambda: self.process_command(text, emotion))
-            else:
-                self.root.after(0, lambda: self.update_status("No speech detected", "ready"))
-                
-        except Exception as e:
-            log.error(f"Listen error: {e}")
-            self.root.after(0, lambda: self.update_status("Error", "error"))
-        finally:
-            self.root.after(0, self.stop_listening)
-    
-    def process_command(self, query: str, emotion: str = "neutral"):
-        """Process user command"""
-        # Check for skill match first
-        for skill in self.skills:
-            if skill.matches(query):
-                response = skill.run(query, self)
-                self.respond(response, emotion)
-                return
-        
-        # Use OpenAI for general queries
-        if self.openai_assistant.enabled:
-            response = self.openai_assistant.get_response(query)
-            self.respond(response, emotion)
-        else:
-            self.respond("I understand. How else can I help?", emotion)
-    
-    def respond(self, text: str, emotion: str = "neutral"):
-        """Respond to user"""
-        # Add to chat
-        self.add_message("nexa", text, emotion)
-        
-        # Text to speech
-        if self.google_services.enabled:
-            audio_data = self.google_services.text_to_speech(text)
-            if audio_data:
-                threading.Thread(
-                    target=self.audio_handler.play_audio,
-                    args=(audio_data,),
-                    daemon=True
-                ).start()
-        
-        self.update_status("Ready", "ready")
-    
-    def clear_chat(self):
-        """Clear chat history"""
-        self.chat_display.config(state=tk.NORMAL)
-        self.chat_display.delete(1.0, tk.END)
-        self.chat_display.config(state=tk.DISABLED)
-        self.openai_assistant.reset_conversation()
-        self.conversation_history = []
-    
-    def show_settings(self):
-        """Show settings dialog"""
-        messagebox.showinfo(
-            "Settings",
-            "Settings panel coming soon!\n\n"
-            "Configure:\n"
-            "- Wake word sensitivity\n"
-            "- Voice preferences\n"
-            "- API keys\n"
-            "- Emotion detection"
-        )
-    
-    def on_closing(self):
-        """Handle window closing"""
-        if messagebox.askokcancel("Quit", "Do you want to quit Nexa?"):
-            self.cleanup()
-            self.root.destroy()
-    
-    def cleanup(self):
-        """Clean up resources"""
-        log.info("Cleaning up resources...")
-        self.wake_detector.cleanup()
-        self.audio_handler.cleanup()
-    
-    def run(self):
-        """Run the application"""
-        log.info("Nexa AI Assistant started")
-        self.add_message("nexa", "Hello! I'm Nexa, your AI assistant. How can I help you today?")
-        self.root.mainloop()
 
-# ──────────────────────────────────────────────────────────────────
+        return cls(
+            speaker, listener,
+            CommandBus(skills, speaker),
+            emotion_detector, emotional_support,
+            cfg,
+        )
+
+    # FIX: moved _handle_emotion from FileOpenSkill into Nexa where it belongs
+    def _handle_emotion(self, emotion: str, query: str) -> bool:
+        """
+        Handle detected emotion. Returns True if emotion was handled, False otherwise.
+        """
+        if emotion in ['sad', 'stressed']:
+            log.info(f"User emotion detected as {emotion}. Providing emotional support.")
+            self._emotional_support.run(query, self._speaker)
+
+            # Listen for their preference
+            response = self._listener.listen()
+
+            # Provide the requested support
+            if response:
+                if "joke" in response:
+                    self._emotional_support.provide_support("joke", self._speaker)
+                elif "fact" in response:
+                    self._emotional_support.provide_support("fun_fact", self._speaker)
+                elif "motivat" in response:
+                    self._emotional_support.provide_support("motivation", self._speaker)
+                elif "music" in response:
+                    self._emotional_support.provide_support("music", self._speaker)
+                else:
+                    self._emotional_support.provide_support("motivation", self._speaker)
+
+            return True
+
+        elif emotion == 'angry':
+            self._speaker.say("I sense some frustration. Let me know how I can help you better.")
+            return False
+
+        return False
+
+    def run(self) -> None:
+        self._speaker.say(_greeting())  # initial greeting
+
+        while True:
+            # Periodically check emotion
+            check_emotion = (
+                self._interaction_count % self._cfg.emotion_check_interval == 0
+            )
+
+            if check_emotion and self._emotion_detector.enabled:
+                query_result = self._listener.listen(return_audio=True)
+                if isinstance(query_result, tuple):
+                    query, audio_data = query_result
+                else:
+                    query      = query_result
+                    audio_data = None
+            else:
+                query      = self._listener.listen()
+                audio_data = None
+
+            self._interaction_count += 1
+
+            if not query:
+                continue  # nothing heard — loop again
+
+            # Check emotion if audio data is available
+            if audio_data is not None and self._emotion_detector.enabled:
+                emotion = self._emotion_detector.analyze_audio(audio_data)
+                if self._handle_emotion(emotion, query):
+                    continue  # Emotion was handled, skip to next iteration
+
+            # check for exit commands
+            if any(w in query for w in ("exit", "stop", "goodbye", "shut down")):
+                self._speaker.say("Goodbye. Have a great day.")
+                break
+
+            # try to handle command
+            if not self._bus.dispatch(query):
+                self._speaker.say("Kindly repeat.")
+
+# ──────────────────────────────────────────────
 #   ENTRY POINT
-# ──────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 if __name__ == "__main__":
-    app = NexaApp()
-    app.run()
+    Nexa.build().run()
