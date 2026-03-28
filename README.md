@@ -32,6 +32,7 @@ User: "Remind me to study at 6 PM"
 → AI creates reminder automatically  
 
 ## 👥 Team  
-- Your Name  
-- Friend 1  
-- Friend 2
+- Akshaya 
+- Jacklin . V
+- Sandya . A
+- Shantavva . R.B
